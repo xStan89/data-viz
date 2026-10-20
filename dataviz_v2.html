@@ -1406,6 +1406,8 @@
     maxNodeSize: 100,
     sizeScale: 1.0,
     nodeShape: 'circle',
+    // "Hide nodes with N or less connections". null/blank = show every node.
+    hideMaxConnections: null,
     // Physics / Auto-Position (four independent 0-100 component strengths)
     forceStrength: 50,        // edge attraction + Barnes-Hut repulsion
     stressStrength: 35,       // global graph-hop distance preservation
@@ -1458,6 +1460,13 @@
   let animationTime = 0;
   let animationScheduled = false;
   let links = [];
+  // The full data set as loaded. `nodes` / `links` above are the visible
+  // subset left after the "Hide nodes with N or less connections" filter;
+  // everything downstream (physics, sizing, legends, search, info panel,
+  // cells, story mode) reads only that subset, so hidden entities behave as
+  // if they were not in the data at all.
+  let allNodes = [];
+  let allLinks = [];
   let nodeById = new Map();
   let adjacency = new Map();
   let connectionSources = new Map();
@@ -1900,13 +1909,15 @@
 
       // CLEAN THE SAVED DATA: drop saved positions for entities that no longer
       // exist, so a subsequent "Export saved HTML" reflects only current data.
-      const liveNames = new Set(nodes.map(n => n.name));
+      // (Entities hidden by the connection filter still exist, so their
+      // saved positions are kept.)
+      const liveNames = new Set(allNodes.map(n => n.name));
       Array.from(savedPositions.keys()).forEach(k => {
         if (!liveNames.has(k)) savedPositions.delete(k);
       });
 
-      // A previously-selected/hovered node may have been removed.
-      if (selectedNode && !liveNames.has(selectedNode.name)) {
+      // A previously-selected/hovered node may have been removed or hidden.
+      if (selectedNode && !nodeById.has(selectedNode.id)) {
         selectedNode = null;
         if (!isStoryMode) clearInfoPanel();
       }
@@ -1989,21 +2000,24 @@
     nodes = entitiesData.map((d, i) => createNodeFromData(d, i));
     nodeById = new Map(nodes.map(n => [n.id, n]));
 
-    // Build entity views map if we have views
+    // Build entity views map if we have views (the per-view entity cache is
+    // built by applyConnectionFilter, once the visible set is known)
     if (hasViewsColumn) {
       buildEntityViewsMap(entitiesData);
-      buildViewEntitiesCache();
     }
 
     // Create links
     processLinksData(connectionsData);
 
-    // Build adjacency and compute connection value totals
-    buildAdjacency();
-    computeConnectionValueTotals();
-
-    // Apply any manually-saved node positions (overrides sheet X/Y)
+    // Apply any manually-saved node positions (overrides sheet X/Y). Done on
+    // the full set so a hidden node keeps its spot for when it's shown again.
     applySavedPositions();
+
+    // Keep the full data, then derive the visible nodes/links from it. This
+    // also builds adjacency, connection value totals and the search index.
+    allNodes = nodes;
+    allLinks = links;
+    applyConnectionFilter();
 
     // Resolve the "Cell" column against the current cell configuration
     normalizeCellSettings();
@@ -2395,6 +2409,8 @@
 
     // Populate cache
     entityViewsMap.forEach((viewIds, entityId) => {
+      // Entities hidden by the connection filter are left out of every view.
+      if (!nodeById.has(entityId)) return;
       viewIds.forEach(viewId => {
         // Only add if view exists in viewsById
         if (viewsById.has(viewId)) {
@@ -2410,6 +2426,74 @@
   function updateStoryButtonVisibility() {
     const shouldShow = viewsData.length > 0 && hasViewsColumn;
     storyBtn.style.display = shouldShow ? 'block' : 'none';
+  }
+
+  /************************************************************************
+   * CONNECTION FILTER — "Hide nodes with N or less connections"
+   * Connections are counted on the full data (distinct entities linked to,
+   * either direction — the same count as the "# of connections" size mode).
+   * Entities at or below the threshold are dropped from `nodes`, and every
+   * connection touching them is dropped from `links`.
+   ************************************************************************/
+  function hideConnectionThreshold() {
+    const v = formattingSettings.hideMaxConnections;
+    if (v === null || v === undefined || String(v).trim() === '') return null;
+    const n = Math.floor(Number(v));
+    return (isFinite(n) && n >= 0) ? n : null;
+  }
+
+  function applyConnectionFilter() {
+    const max = hideConnectionThreshold();
+    if (max == null) {
+      nodes = allNodes.slice();
+      links = allLinks.slice();
+    } else {
+      const nbrs = new Map();
+      allLinks.forEach(l => {
+        const s = l.source.id, t = l.target.id;
+        if (!nbrs.has(s)) nbrs.set(s, new Set());
+        if (!nbrs.has(t)) nbrs.set(t, new Set());
+        nbrs.get(s).add(t);
+        nbrs.get(t).add(s);
+      });
+      const keep = new Set();
+      allNodes.forEach(n => {
+        const deg = nbrs.has(n.id) ? nbrs.get(n.id).size : 0;
+        if (deg > max) keep.add(n.id);
+      });
+      nodes = allNodes.filter(n => keep.has(n.id));
+      links = allLinks.filter(l => keep.has(l.source.id) && keep.has(l.target.id));
+    }
+    nodeById = new Map(nodes.map(n => [n.id, n]));
+    nameIndex = nodes.map(n => n.name);
+    _lineSizeRange = null;
+    buildAdjacency();
+    computeConnectionValueTotals();
+    if (hasViewsColumn) buildViewEntitiesCache();
+  }
+
+  // Live change from the Options menu: re-filter and re-lay out in place.
+  // Surviving nodes keep their current positions; newly revealed ones are
+  // placed by physics (or by their saved position / cell).
+  function setHideMaxConnections(v) {
+    formattingSettings.hideMaxConnections = v;
+    if (!allNodes.length) return;
+    applyConnectionFilter();
+    if (selectedNode && !nodeById.has(selectedNode.id)) {
+      selectedNode = null;
+      if (isStoryMode) hideEntityModal(); else clearInfoPanel();
+    }
+    if (hoveredNode && !nodeById.has(hoveredNode.id)) hoveredNode = null;
+    hoveredConnection = null;
+    updateNodeSizes();
+    updateCategoryColors();
+    updateLegend();
+    updateShapeLegend();
+    updateCellAssignments();
+    computeGridLayout();
+    updatePhysics();
+    if (selectedNode && !isStoryMode) populateInfoPanel(selectedNode);
+    render();
   }
 
   function buildAdjacency() {
@@ -4937,18 +5021,28 @@
         unhighlightedNodes.forEach(n => drawLabel(n));
       }
     } else {
-      // Default 'hover' mode: labels on selection, connections, and hover
+      // Default 'hover' mode: labels on the selection and its connections,
+      // plus the hovered node and its connections. Each label is drawn once.
+      const labelled = new Set();
+      const labelOnce = n => { if (n && !labelled.has(n)) { labelled.add(n); drawLabel(n); } };
+
       if (selectedNode) {
+        const selNbrs = adjacency.get(selectedNode.id) || new Set();
         highlightedNodes.forEach(n => {
-          if (adjacency.get(selectedNode.id).has(n.id) || n === selectedNode) {
-            drawLabel(n);
-          }
+          if (n === selectedNode || selNbrs.has(n.id)) labelOnce(n);
         });
       }
 
-      // Draw label for hovered node (if not already labeled)
-      if (hoveredNode && hoveredNode !== selectedNode) {
-        drawLabel(hoveredNode);
+      if (hoveredNode) {
+        // Nodes connected to the hovered one. Follows only the lines on
+        // screen (story mode narrows these to the current view) and skips
+        // nodes dimmed by a selection or a legend filter.
+        visibleLinks.forEach(l => {
+          const other = l.source === hoveredNode ? l.target
+                      : l.target === hoveredNode ? l.source : null;
+          if (other && highlightedSet.has(other.id)) labelOnce(other);
+        });
+        labelOnce(hoveredNode);
       }
     }
 
@@ -8054,7 +8148,7 @@ return {
 
   // Only warn when something would actually be lost.
   function confirmCellChange(onYes, onNo) {
-    const hasManual = nodes.some(n => n.cellValue != null && savedPositions.has(n.name));
+    const hasManual = allNodes.some(n => n.cellValue != null && savedPositions.has(n.name));
     if (!hasManual) { onYes(); return; }
     showCellConfirm('All manually placed nodes will re-space.', onYes, onNo);
   }
@@ -8062,7 +8156,7 @@ return {
   // Changing the count or the configuration drops manual placements.
   function applyCellConfigChange() {
     invalidateCells();
-    nodes.forEach(n => { if (n.cellValue != null) { savedPositions.delete(n.name); n.manualInCell = false; } });
+    allNodes.forEach(n => { if (n.cellValue != null) { savedPositions.delete(n.name); n.manualInCell = false; } });
     normalizeCellSettings();
     updateCellAssignments();
     computeGridLayout();
@@ -8212,6 +8306,36 @@ return {
     numberRow(s, 'Min node size', fs, 'minNodeSize', null, ar);
     numberRow(s, 'Max node size', fs, 'maxNodeSize', null, ar);
     numberRow(s, 'Scale node size', fs, 'sizeScale', '0.1', ar);
+    {
+      const r = document.createElement('div'); r.className = 'opt-row';
+      const l1 = document.createElement('label'); l1.className = 'cap';
+      l1.style.flex = '0 0 auto'; l1.textContent = 'Hide nodes with';
+      const inp = document.createElement('input');
+      inp.type = 'number'; inp.min = '0'; inp.step = '1'; inp.placeholder = '\u2014';
+      inp.style.width = '64px';
+      inp.value = (fs.hideMaxConnections == null) ? '' : String(fs.hideMaxConnections);
+      const l2 = document.createElement('label'); l2.className = 'cap';
+      l2.textContent = 'or less connections';
+      let t = null;
+      const commit = () => {
+        clearTimeout(t); t = null;
+        const raw = inp.value.trim();
+        let v = null;
+        if (raw !== '') {
+          const n = Math.floor(Number(raw));
+          if (isFinite(n) && n >= 0) v = n;
+        }
+        if (v === (fs.hideMaxConnections == null ? null : fs.hideMaxConnections)) return;
+        setHideMaxConnections(v);
+      };
+      inp.addEventListener('input', () => { clearTimeout(t); t = setTimeout(commit, 400); });
+      inp.addEventListener('change', commit);
+      inp.addEventListener('blur', () => {
+        inp.value = (fs.hideMaxConnections == null) ? '' : String(fs.hideMaxConnections);
+      });
+      r.appendChild(l1); r.appendChild(inp); r.appendChild(l2); s.appendChild(r);
+    }
+    hintEl(s, 'Leave blank to show every node. Entities with this many connections or fewer are removed completely, along with their connections. The map then works as if they weren\u2019t in the data. Connections are counted on the full data.');
     selectRow(s, 'Default shape', fs, 'nodeShape', [['circle', 'Circle'], ['square', 'Square'], ['diamond', 'Diamond'], ['triangle', 'Triangle']], ar);
     colorRow(s, 'Node color', fs, 'nodeColor', ar);
     hintEl(s, 'Default fill. A "Custom Node Color" in the Entities sheet replaces it for that row, and replaces the node\u2019s image too.');
@@ -8817,7 +8941,8 @@ return {
   /* ---------- export: saved HTML (both tools) ---------- */
   function gatherPositions() {
     const positions = {};
-    nodes.forEach(n => {
+    // allNodes, so a node hidden by the connection filter keeps its position.
+    allNodes.forEach(n => {
       // Auto-spaced cell nodes are recomputed on load, so don't freeze them.
       if (n.cellIdx != null && !n.manualInCell) return;
       if (n.hasGridCoords && isFinite(n.gridX) && isFinite(n.gridY)) {
